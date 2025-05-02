@@ -1,9 +1,7 @@
 from agno.tools import Toolkit 
 from agno.agent import Agent
 from agno.tools.thinking import ThinkingTools
-import gspread
 import json
-from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from typing import List, Dict, Optional
 from pymongo.mongo_client import MongoClient
@@ -100,8 +98,15 @@ class MongoDBUtility(Toolkit):
 
     def aggregate_documents(self, collection: str, pipeline: List[Dict]) -> List[Dict]:
         """Runs an aggregation pipeline on a MongoDB collection."""
+        if not isinstance(pipeline, list) or not pipeline:
+            raise ValueError("The 'pipeline' argument must be a non-empty list of dictionaries.")
+        
         col = self.db[collection]
-        return str(list(col.aggregate(pipeline)))
+        try:
+            result = list(col.aggregate(pipeline))
+            return str(result)
+        except Exception as e:
+            raise RuntimeError(f"Error during aggregation: {e}")
 
     def date_tool(self):
         today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

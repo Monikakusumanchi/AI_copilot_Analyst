@@ -40,11 +40,101 @@ from agno.models.groq import Groq
 from tools.tools import MongoDBUtility, Googletoolkit
 import streamlit as st
 import requests
-
+from tools.ragdb import RagToolkit
+from decimal import Decimal, getcontext
+import traceback
+import time
+from pymongo import MongoClient
+MODEL_PRICING = {
+    # OpenAI Models (Example Pricing - VERIFY CURRENT PRICES)
+    "gpt-4o": {"input": Decimal("5.00"), "output": Decimal("15.00")},
+    "gpt-4o-mini": {"input": Decimal("0.15"), "output": Decimal("0.60")},
+    "gpt-4-turbo": {"input": Decimal("10.00"), "output": Decimal("30.00")},
+    "gpt-3.5-turbo-0125": {"input": Decimal("0.50"), "output": Decimal("1.50")},
+    "gemini-2.0-flash": {"input": Decimal("0.15"), "output": Decimal("0.60")},
+    "gemini-1.5-flash": {"input": Decimal("0.15"), "output": Decimal("0.60")},
+    # Groq Models (Often free tier or very low cost - check their specifics)
+    # Example: Assuming negligible cost for this demo if on free tier
+    "llama3-8b-8192": {"input": Decimal("0.00"), "output": Decimal("0.00")},
+    "llama3-70b-8192": {"input": Decimal("0.00"), "output": Decimal("0.00")},
+    "mixtral-8x7b-32768": {"input": Decimal("0.00"), "output": Decimal("0.00")},
+    # Add other models you might use (e.g., from Anthropic, Cohere)
+    # ...
+    # --- Embedding Model Pricing (per Million Tokens) ---
+    # Example: text-embedding-3-small (VERIFY CURRENT PRICE)
+    "text-embedding-3-small": {"input": Decimal("0.02"), "output": Decimal("0.00")}, # Output cost usually N/A
+    "text-embedding-3-large": {"input": Decimal("0.13"), "output": Decimal("0.00")},
+}
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+def calculate_cost_per_interaction(result):
+    """Calculate the cost for each interaction with the LLM."""
+    interaction_costs = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_cost = Decimal("0.00")
+    getcontext().prec = 10  # Set precision for Decimal calculations
 
+    try:
+        if not result or not hasattr(result, 'metrics') or not result.metrics:
+            st.warning("Metrics not found in agent result. Cannot estimate cost.")
+            return [], 0, 0, Decimal("0.00")
+
+        # Extract metrics
+        metrics = result.metrics
+        input_tokens_list = metrics.get('input_tokens', [])
+        output_tokens_list = metrics.get('output_tokens', [])
+
+        # Ensure input_tokens_list and output_tokens_list are lists
+        if not isinstance(input_tokens_list, list):
+            if isinstance(input_tokens_list, int):  # Handle single integer case
+                input_tokens_list = [input_tokens_list]
+            else:
+                st.error("Error: 'input_tokens' is not a list or valid iterable.")
+                return [], 0, 0, Decimal("0.00")
+
+        if not isinstance(output_tokens_list, list):
+            if isinstance(output_tokens_list, int):  # Handle single integer case
+                output_tokens_list = [output_tokens_list]
+            else:
+                st.error("Error: 'output_tokens' is not a list or valid iterable.")
+                return [], 0, 0, Decimal("0.00")
+
+        primary_model = getattr(result, 'model', None)
+
+        if primary_model and primary_model in MODEL_PRICING:
+            pricing = MODEL_PRICING[primary_model]
+            input_cost_mill = pricing.get('input', Decimal("0.00"))
+            output_cost_mill = pricing.get('output', Decimal("0.00"))
+
+            # Calculate cost for each interaction
+            for i, (input_tokens, output_tokens) in enumerate(zip(input_tokens_list, output_tokens_list)):
+                prompt_cost = (Decimal(input_tokens) / Decimal("1000000")) * input_cost_mill
+                completion_cost = (Decimal(output_tokens) / Decimal("1000000")) * output_cost_mill
+                interaction_cost = prompt_cost + completion_cost
+
+                interaction_costs.append({
+                    "interaction": i + 1,
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "cost": interaction_cost
+                })
+
+                # Update totals
+                total_prompt_tokens += input_tokens
+                total_completion_tokens += output_tokens
+                total_cost += interaction_cost
+
+        else:
+            st.warning(f"Pricing not found for primary model '{primary_model}'. Cost calculation might be incomplete.")
+
+        return interaction_costs, total_prompt_tokens, total_completion_tokens, total_cost
+
+    except Exception as e:
+        st.error(f"Error during cost calculation: {e}")
+        traceback.print_exc()
+        return [], 0, 0, Decimal("0.00")
 # from pydantic import BaseModel
 # from typing import Any, Dict, List, Optional, Union
 
@@ -52,118 +142,84 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 #     query: Union[Dict[str, Any], List[Dict[str, Any]]]  # Supports both simple queries and aggregation pipelines
 #     final_output: Union[str, int, float, List[Dict[str, Any]]]  # Supports various output types
 #     dataframe: Optional[str] = None 
+rag_toolkit = RagToolkit()
+
 def run_agent():
 
     uri = os.getenv("uri")
-    credentials_path = "credentials.json"
-    sheet_id =  os.getenv("sheet_id")
+
     client = MongoClient(uri)
 
     agent = Agent(
-            model= OpenAIChat(id="gpt-4o",temperature=0),
-            reasoning_model=Groq(id="deepseek-r1-distill-llama-70b", temperature=0),
+            model= OpenAIChat(id="gpt-4o-mini",temperature=0),
+            # reasoning_model=Groq(id="deepseek-r1-distill-llama-70b", temperature=0),
 
-            tools = [MongoDBUtility(),ThinkingTools(),Googletoolkit(credentials_path, sheet_id),PandasTools()],
+            tools = [MongoDBUtility(),ThinkingTools(),PandasTools(),rag_toolkit],
             instructions="""
-                    You are an intelligent MongoDB assistant that dynamically constructs and executes queries based on user input. Follow these steps:
-                    You are a MongoDB assistant that **must** execute the query using the appropriate tools.
+                    You are an intelligent MongoDB assistant that dynamically constructs and executes queries based on user input. Follow these steps METICULOUSLY:
 
-                    1️ **Identify the Relevant Collection:**
-                    - Use `ListCollectionsTool` to retrieve the available collections.
-                    - Match the collection name with the user query if there is a some match in name from the user input.
-                    - If unsure, ask the user for clarification.
 
-                    2️ **Retrieve Schema Information:**
-                    - Use `MongoSchemaTool` to get the schema of the identified collection.
-                    - Extract the correct field names and data types.
+            1️⃣ **Schema Identification & Planning (MUST DO FIRST):**
+               - Immediately use the `RagToolkit` with the original user query.
+               - **Wait for the output** from `RagToolkit`. It will be a JSON string containing keys like `relevant_collection`, `relevant_fields`, `chain_of_thought`, and `reasoning`.
+               - **Parse this JSON output.**
+               - **CRITICAL:** Extract the `chain_of_thought` from the RAG tool's output. This is your **mandatory plan** for the subsequent steps.
+               - Also extract the `relevant_collection` and `relevant_fields`.
+               - Use the `get_collection_schema` tool to retrieve the schema of the `relevant_collection`. This will provide the datatypes and structure of the fields in the collection.
+               - If the RAG tool or `get_collection_schema` returns an error, or if `relevant_collection` or `chain_of_thought` is null/missing, state that you cannot proceed with planning the query due to missing schema information or tool failure, explain the reason given in the 'reasoning' or 'error' field, and STOP.
 
-                    3️ **Generate an Optimized Query:**
-                    - Construct a MongoDB query based on the user's intent.
-                    - Use appropriate filters (`$eq`, `$gte`, `$lte`, `$regex`, etc.).
-                    - **Only include necessary fields** in the projection, avoiding `_id` unless required.
-                    - If the query involves aggregation (e.g., counting or averaging), use `AggregateDocumentsTool`.
 
-                    4️ **Execute the Query:**
-                    - If the query is a **count operation**, use `CountDocumentsTool`.
-                    - If retrieving multiple documents, use `FindDocumentsTool`.
-                    - For summary statistics (e.g., average duration), use `AggregateDocumentsTool`.
+            2️⃣ **Generate an Optimized Query (Based STRICTLY on RAG Plan):**
+               - **Follow the step-by-step `chain_of_thought`** provided by the `RagToolkit` in Step 1 to construct the specific MongoDB query (or aggregation pipeline).
+               - Use the `relevant_collection` identified in Step 1.
+               - Implement filtering logic (`$eq`, `$gte`, `$regex`, etc.) exactly as described in the `chain_of_thought`.
+               - Project *only* the `relevant_fields` identified in Step 1 (plus any other fields explicitly required by the `chain_of_thought` for filtering, aggregation, or sorting), avoiding `_id` unless specified in the plan or required.
+               - If the `chain_of_thought` indicates aggregation, construct the aggregation pipeline as outlined.
 
-                    5️ **Return a Clear and Concise Response:**
-                    - Show the query that you execuited in the mongodb database
-                    - Format the output in readable JSON or tabular format.
-                    - Provide a **brief explanation** of the result.
-                    - If no results are found, state it clearly.
-                    - If `final_output` is a **list of dictionaries (documents)**, create an additional `dataframe` field:
-                        - Convert the list to a Pandas DataFrame.
-                        - Store the **string representation** of the DataFrame in the `dataframe` field.
-                    - **Parse the string output** of the `FindDocumentsTool` and convert to list of dictionaries and save in google sheet where each document as row into Google Sheets.
-                    - save to google sheets if the question is to get the records form the mongodb database
 
-                    ---
-                    3. **Error Handling and Fallback:**
-                        - **Problem:** The agent currently doesn't gracefully handle errors when saving to Google Sheets.
-                        - **Solution:** Implement error handling with the Pandas DataFrame fallback *in the agent's logic*.   Because you can't directly modify the tool's code from inside the agent instructions, the agent needs to *react* to a failed Google Sheets save.
+            3️⃣ **Execute the Query (Based on RAG Plan & Generated Query):**
+               - Determine the correct MongoDB tool to use based **BOTH** on the `chain_of_thought` from Step 1 and the query generated in Step 2:
+                 - If the plan/query involves **counting** documents, use `CountDocumentsTool`.
+                 - If the plan/query involves **retrieving multiple documents**, use `FindDocumentsTool`.
+                 - If the plan/query involves **aggregation** (like averaging, grouping), use `AggregateDocumentsTool`.
+               - Execute the precise query/pipeline generated in Step 2 using the chosen tool.
 
-                        Here's the general pattern for agent instruction:
 
-                        ```
-                        If the query requires retrieving records, parse it using json.loads.  Then, attempt to save the data to Google Sheets.  If saving to Google Sheets results in an error or an empty response, *immediately* convert the data into a Pandas DataFrame and output the DataFrame.
-                        ```
+            4️⃣ **Return the Final Answer (MANDATORY):**
+           - Always return the final answer to the user based on the query results.
+           - **Show the final MongoDB query or aggregation pipeline** that you executed (the one generated in Step 2).
+           - Present the result obtained from the MongoDB tool in Step 3.
+           - **Format the output** clearly:
+             - If the result is a count or a single aggregation result (like average), state it directly.
+             - If the result is a list of documents (from `FindDocumentsTool`):
+                 - Parse the string output from the tool into a Python list of dictionaries.
+                 - Present the data in a readable format (e.g., formatted JSON snippet or a summary table description if too long).
+           - Provide a **brief explanation** of the result in natural language.
+           - If no results are found by the MongoDB query, state this clearly ("No matching documents found.").
 
-                        4.  **Google Sheets API Permissions:**
-                        -   **Problem:** Incorrect or missing permissions on the service account used by `gspread`.
-                        -   **Solution:**
+            ---
+            **Error Handling Notes:**
+            - Prioritize the `RagToolkit` in Step 1. If it fails, do not attempt subsequent steps.
+            - Handle potential errors during query execution (Step 3) gracefully. Report the error message from the tool.
+            - Follow the Google Sheets saving logic and DataFrame fallback precisely as described in Step 4.
 
-                            *   **Check the Credentials:**  Ensure the `credentials.json` file is valid and contains the correct service account credentials.
-                            *   **Verify Sheet Sharing:**  The service account's email address MUST be explicitly granted "Editor" access to the Google Sheet. Sharing the sheet with your personal Google account is NOT sufficient.
 
-                        5.  **Formate data problem:**
-                            If the query requires retrieving records, parse it using json.loads.  Then, attempt to save the data to Google Sheets.  If saving to Google Sheets results in an error or an empty response, *immediately* convert the data into a Pandas DataFrame and output the DataFrame.
-                            If the query requires retrieving records (using `FindDocumentsTool`), attempt to save the **Python list of dictionaries** directly to Google Sheets (as described in step 5). If the `save_to_google_sheets` tool returns an error or an empty/failure response, *then* convert the original **Python list of dictionaries** into a Pandas DataFrame and output the DataFrame representation in your final response.
-    ```
-                        **Complete Example with Error Handling**
+            ---
+            **Example Snippets (Illustrative - actual execution depends on RAG output):**
 
-                    **📌 Example Workflows:**
 
-                    **Q:** "How many calls did Priya Sharma make this week?"
-                    - Identify `calls` collection.
-                    - Retrieve schema (ensure `caller`, `timestamp` fields exist).
-                    - Construct query: `{"caller": "Priya Sharma", "timestamp": {"$gte": <7_days_ago>}}`
-                    - Execute using `CountDocumentsTool`
-                    - Output:   query:{
-                                    "caller": "Priya Sharma",
-                                    "timestamp": {"$gte": <7_days_ago>}}`
-                                final output:`"Priya Sharma made 12 calls this week."`
+            *Initial thought process for "List failed calls last week":*
+            1. Call `RagToolkit` with "List failed calls last week".
+            2. RAG Output (example): `{"relevant_collection": "calls", "relevant_fields": ["caller", "receiver", "timestamp", "status"], "chain_of_thought": "1. Filter 'calls' collection by status='failed'. 2. Filter by timestamp >= <start_of_last_week>. 3. Project caller, receiver, timestamp, status.", "reasoning": "Query asks for failed calls, schema has status and timestamp."}`
+            3. Follow `chain_of_thought`: Build query `{"status": "failed", "timestamp": {"$gte": <date>}}` for collection `calls` with projection `{caller: 1, receiver: 1, timestamp: 1, status: 1, _id: 0}`.
+            4. Plan indicates retrieving documents -> Use `FindDocumentsTool`.
+            5. Execute `FindDocumentsTool` with the built query.
+            6. Process result: Parse list, try Google Sheets, fallback to DataFrame if needed, present results.
+            **Make sure the agent runs the whole process
 
-                    **Q:** "List all failed calls in the last 7 days."
-                    - Identify `calls` collection.
-                    - Retrieve schema (ensure `status`, `timestamp` fields exist).
-                    - Construct query: `{"status": "failed", "timestamp": {"$gte": <7_days_ago>}}`
-                    - Do not use limit in the query unless specified in the question.
-                    - Execute using `FindDocumentsTool`
-                    - Show the tabulat formate of data as well as an output
-                    - Output:  query:`{
-                                "status": "failed",
-                                "timestamp": {"$gte": <7_days_ago>}
-                                }`
-                               final output:`[{caller, receiver, timestamp}, ...]` and convert the str output from the list collections and save it in google sheet with each document in each row of google sheet or if it fails save as pandas dataframe
-                               for that use pandas.Dataframe(data) and show the dataframe
-
-                    **Q:** "What is the average call duration for completed calls?"
-                    - Identify `calls` collection.
-                    - Retrieve schema (ensure `duration`, `status` fields exist).
-                    - Construct aggregation: `[{"$match": {"status": "completed"}}, {"$group": {"_id": None, "avg_duration": {"$avg": "$duration"}}}]`
-                    - Execute using `AggregateDocumentsTool`
-                    - Output: query: `[
-                                        {"$match": {"status": "completed"}},
-                                        {"$group": {"_id": None, "avg_duration": {"$avg": "$duration"}}}
-                                        ]`
-                              final output: `"The average call duration is 45.23 seconds."`
-
-                    ---
-                    Always ensure that the queries align with the **actual schema** of the collection.
-
-                """,
+            ---
+            Always use the collection and fields identified by `RagToolkit`. Do not invent schema elements. Ensure queries align with the plan from the RAG tool. Use the current date provided for relative date calculations ONLY IF the RAG plan requires it.
+        """,
                 show_tool_calls=True,
                 add_datetime_to_instructions=True,
                 markdown=True,
@@ -230,6 +286,7 @@ if prompt := st.chat_input("Ask me anything about your data"):
         with st.spinner("Analyzing your question..."):
             result = agent.run(prompt)
 
+        interaction_costs, total_prompt_tokens, total_completion_tokens, total_cost = calculate_cost_per_interaction(result)
 
         # Option 1: Get the formatted string representation of each tool call
         formatted_calls = result.formatted_tool_calls
@@ -280,6 +337,23 @@ if prompt := st.chat_input("Ask me anything about your data"):
                     st.markdown("---") # Separator between interactions
         print(result)
         # Display assistant response
+
+        st.markdown("### Cost and Tokens Per Interaction")
+        print(interaction_costs)
+        for interaction in interaction_costs:
+            st.markdown(f"**Interaction {interaction['interaction']}**")
+            st.write(f"Prompt Tokens: {interaction['prompt_tokens']}")
+            st.write(f"Completion Tokens: {interaction['completion_tokens']}")
+            st.write(f"Cost: ${interaction['cost']:.6f}")
+            st.markdown("---")
+
+        st.caption("Note: Cost estimation is based on reported agent model tokens (e.g., GPT-4o-mini) and may exclude costs incurred *inside* custom tools like RAG/Embedding unless explicitly tracked and reported by the tool.")
+        st.markdown("### Total Tokens and Cost")
+        st.write(f"**Total Prompt Tokens:** {total_prompt_tokens}")
+        st.write(f"**Total Completion Tokens:** {total_completion_tokens}")
+        st.write(f"**Total Cost (USD):** ${total_cost:.6f}")
+        st.markdown("---")
+        st.markdown("---")
         st.markdown(result.content)
         
         st.session_state.messages.append({"role": "assistant", "content":result.content })
