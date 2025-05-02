@@ -158,7 +158,6 @@ def run_agent():
             instructions="""
                     You are an intelligent MongoDB assistant that dynamically constructs and executes queries based on user input. Follow these steps METICULOUSLY:
 
-
             1️⃣ **Schema Identification & Planning (MUST DO FIRST):**
                - Immediately use the `RagToolkit` with the original user query.
                - **Wait for the output** from `RagToolkit`. It will be a JSON string containing keys like `relevant_collection`, `relevant_fields`, `chain_of_thought`, and `reasoning`.
